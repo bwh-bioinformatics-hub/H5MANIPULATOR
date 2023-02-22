@@ -44,7 +44,7 @@ from github:
 
 ```
 Sys.setenv(GITHUB_PAT = "your-access-token-here")
-devtools::install_github("acicalo2/H5MANIPULATOR")
+devtools::install_github("bwh-bioinformatics-hub/H5MANIPULATOR")
 ```
 
 #  .h5 structure
