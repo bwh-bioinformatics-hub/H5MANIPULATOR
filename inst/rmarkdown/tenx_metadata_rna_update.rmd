@@ -1,0 +1,537 @@
+---
+title: "Add .h5 metadata to 10x Genomics data"
+author: 
+ - Anthony Cicalo
+date: "`r format(Sys.time(), '%Y-%m-%d')`"
+output:
+#  html_document:
+#    code_folding: hide
+#    df_print: paged
+#    self_contained: true
+params:
+  in_h5: NULL
+  in_mol: NULL
+  in_sum: NULL
+  in_key: NULL
+  in_sample: NULL
+  out_dir: NULL
+---
+
+<a id="contents"></a>
+
+## Contents
+
+#### [Data Processing](#data_processing)
+- [Session Preparation](#session_preparation)
+- [Load Inputs](#load_inputs)
+- [Assemble Metadata](#assemble data)
+- [Data Output](#data_output)
+
+#### [QC Metrics and Plots](#qc_metrics)
+- [Sample-Based QC](#Sample_qc)
+  - [10x Genomics Metrics](#Sample_metrics)
+  - [Read/UMI/Gene Stats](#rug_stats)
+  - [Read/UMI/Gene Histograms](#rug_hists)
+  - [Read/UMI/Gene Scatters](#rug_scatters)
+- [Write QC JSON](#json_out)
+
+#### [Session Info](#session_info)
+
+<a id="data_processing"></a>
+
+## Data Processing
+
+<a id="session_preparation"></a>
+
+### Session Preparation
+
+#### Load libraries:
+```{r Load Libraries}
+start_time <- Sys.time()
+
+quiet_library <- function(...) {
+  suppressPackageStartupMessages(library(...))
+}
+quiet_library(rhdf5)
+quiet_library(H5MANIPULATOR)
+quiet_library(Matrix)
+quiet_library(ggplot2)
+quiet_library(cowplot)
+quiet_library(jsonlite)
+quiet_library(tidyverse)
+quiet_library(googlesheets4)
+quiet_library(rio)
+
+```
+
+Declaring start
+```{r Declare start}
+stm("Starting .h5 metadata analysis")
+stm(paste0("Using H5MANIPULATOR v", installed.packages()["H5MANIPULATOR","Version"]))
+```
+
+#### Argument parsing
+```{r Parse arguments}
+if(is.null(params$in_h5)) {
+  in_h5 <- system.file("testdata/well1.h5", package = "H5MANIPULATOR")
+  in_mol <- system.file("testdata/sample1_molecule_info.h5", package = "H5MANIPULATOR")
+  in_sum <- system.file("testdata/sample1_metrics_summary.csv", package = "H5MANIPULATOR")
+  in_key <- system.file("reference/SampleSheet_fallback.csv", package = "H5MANIPULATOR")
+  in_sample <- "B000-P0C0W0"
+  out_dir <- tempdir()
+} else {
+  in_h5 <- params$in_h5
+  in_mol <- params$in_mol
+  in_sum <- params$in_sum
+  in_key <- params$in_key
+  in_sample <- params$in_sample
+  out_dir <- params$out_dir
+}
+
+
+
+stm(paste0("IN  H5 file         : ", in_h5))
+stm(paste0("IN  Mol Info H5     : ", in_mol))
+stm(paste0("IN  Metrics Summary : ", in_sum))
+stm(paste0("IN  SampleSheet     : ", in_key))
+stm(paste0("IN  Sample ID         : ", in_sample))
+stm(paste0("OUT H5 directory    : ", out_dir))
+```
+
+#### Input Parameters
+```{r Print Arguments}
+print(c(
+  paste0("IN  H5 file         : ", in_h5),
+  paste0("IN  Mol Info H5     : ", in_mol),
+  paste0("IN  Metrics Summary : ", in_sum),
+  paste0("IN  SampleSheet     : ", in_key),
+  paste0("IN  Sample ID         : ", in_sample),
+  paste0("OUT H5 directory    : ", out_dir)
+))
+```
+
+#### Check Input Files
+```{r Check Inputs}
+if(!file.exists(in_h5)) {
+  stm(paste0("ERROR: Cannot find IN H5 file:", in_h5))
+  stop()
+}
+if(!file.exists(in_mol)) {
+  stm(paste0("ERROR: Cannot find IN Mol Info H5 file:", in_mol))
+  stop()
+}
+if(!file.exists(in_sum)) {
+  stm(paste0("ERROR: Cannot find IN Metrics Summary file:", in_sum))
+  stop()
+}
+if(!file.exists(in_key)) {
+  stm(paste0("ERROR: Cannot find IN SampleSheet file:", in_key))
+  stop()
+}
+```
+
+#### Create out directory if missing
+```{r Create Out Dir}
+if(!dir.exists(out_dir)) {
+  stm(paste0("Creating Output Directory: ",out_dir))
+  dir.create(out_dir, 
+             recursive = TRUE)
+}
+```
+
+
+[Return to Contents](#contents)
+
+<a id="load_inputs"></a>
+
+### Load inputs
+
+#### Load scRNA-seq Dataset
+```{r Load Query}
+stm(paste0("Loading HDF5 from ", in_h5))
+h5_list <- h5dump(in_h5)
+```
+
+#### Load SampleSheet
+```{r Load SampleSheet}
+if (length(grep("https",in_key)) > 0) {
+    ss <- read_sheet(in_key)
+    } else if (length(grep(".xlsx",in_key)) > 0 ){
+        ss <- import_list(in_key)
+        ss <- ss$MetaTable_expectedCell
+    } else {
+        ss <- read.csv(in_key)
+}
+
+if ("Final list" %in% colnames(ss)) {
+    ss <- ss %>% filter(ss$"Final list" == 1)
+}
+
+# pull library id
+libraries <- ss %>% filter(Sample == in_sample)
+library_id <- libraries$Library
+
+n_cells <- length(h5_list$matrix$barcodes)
+h5_list <- set_list_path(h5_list,
+                           "/matrix/observations/in_sample",
+                           rep(in_sample, n_cells))
+  
+out_h5 <- file.path(out_dir, paste0(in_sample, "_", library_id, ".h5"))
+out_json <- file.path(out_dir, paste0(in_sample,"_",library_id,"_metrics.json"))
+
+stm(paste0("OUT H5 file         : ", out_h5))
+stm(paste0("OUT JSON file       : ", out_json))
+
+print(c(
+  paste0("OUT H5 file         : ", out_h5),
+  paste0("OUT JSON file       : ", out_json)
+))
+```
+
+#### Read molecule info to get read counts per cell
+```{r Assemble Read Counts}
+stm(paste0("Assembling Read Counts per Cell from ", in_mol))
+
+bc <- sub("-1","",h5_list$matrix$barcodes)
+
+bc_counts <- data.table(mol_idx = h5read(in_mol, "/barcode_idx"),
+                        umi_count = h5read(in_mol, "/count"))
+
+bc_sums <- bc_counts[, .(n_reads = sum(umi_count)), by = mol_idx]
+rm(bc_counts)
+
+mol_bc <- h5read(in_mol, "/barcodes")
+bc_sums$cell_barcode <- mol_bc[bc_sums$mol_idx + 1]
+rm(mol_bc)
+
+bc_sums <- bc_sums[,.(cell_barcode, n_reads)]
+
+n_reads <- bc_sums$n_reads[match(bc, bc_sums$cell_barcode)]
+n_reads[is.na(n_reads)] <- 0
+
+h5_list <- set_list_path(h5_list,
+                           "/matrix/observations/n_reads",
+                           n_reads)
+```
+
+[Return to Contents](#contents)
+
+<a id="assemble_data"></a>
+
+### Assemble data
+
+#### Split matrices if more than one feature type is present
+
+```{r split_matrices}
+h5_list <- h5_list_convert_to_dgCMatrix(h5_list, target = "matrix")
+
+feature_types <- unique(h5_list$matrix$features$feature_type)
+
+if(sum(feature_types != "Gene Expression") > 0) {
+  stm("Separating non-Gene Expression data to additional matrices")
+  
+  mat <- h5_list$matrix_dgCMatrix
+  
+  feature_df <- as.data.frame(h5_list$matrix$features)
+  
+  h5_list$matrix_dgCMatrix <- mat[feature_df$feature_type == "Gene Expression",]
+  h5_list$matrix$features <- as.list(feature_df[feature_df$feature_type == "Gene Expression",])
+}
+```
+
+#### Compute N UMIs and N Genes per cell
+```{r n_umi and n_genes}
+stm("Computing UMI and Gene Counts per Cell")
+
+h5_list <- set_list_path(h5_list,
+                         "/matrix/observations/n_umis",
+                         unname(colSums(h5_list$matrix_dgCMatrix)))
+
+h5_list <- set_list_path(h5_list,
+                         "/matrix/observations/n_genes",
+                         unname(colSums(h5_list$matrix_dgCMatrix > 0)))
+
+h5_list <- h5_list_convert_from_dgCMatrix(h5_list, target = "matrix")
+```
+
+#### Add cell ids
+```{r}
+stm("Adding Cell UUIDs and Names")
+
+h5_list <- add_cell_ids(h5_list,
+                        add_uuid = TRUE,
+                        replace_barcode = TRUE,
+                        retain_original_barcode = TRUE,
+                        add_name = TRUE)
+```
+
+#### Add chrM gene counts
+```{r chrM UMIs}
+stm("Adding chrM count metadata")
+
+if ((unique(h5_list$matrix$features$genome) == "GRCh38") == TRUE){
+    h5_list <- h5_list_add_mito_umis(h5_list)
+    } else {
+        so <- read_h5_seurat(in_h5)
+        all_genes <- h5_list$matrix$features$name
+        mito_genes <- grep("^MT:", all_genes,ignore.case=TRUE,value=TRUE)
+        total_counts_per_cell <- colSums(so@assays$RNA@counts)
+        percent_mito <- colSums(so@assays$RNA@counts[mito_genes, ])/total_counts_per_cell
+        h5_list <- H5MANIPULATOR::set_list_path(h5_list,
+                                     "/matrix/observations/n_mito_umis",
+                                     percent_mito)
+}
+
+
+
+```
+
+#### Add Sample Metrics
+```{r Add Sample Metrics}
+sample_metrics <- read_tenx_metrics(in_sum)
+
+sample_metrics <- as.list(sample_metrics)
+
+h5_list <- set_list_path(h5_list,
+                         "/sample",
+                         sample_metrics)
+
+h5_list <- set_list_path(h5_list,
+                         "/sample/sample_id",
+                         in_sample)
+
+```
+
+[Return to Contents](#contents)
+
+<a id="data_output"></a>
+
+### Write Output
+
+#### Write HDF5 files
+```{r Write split files}
+stm(paste0("Writing HDF5 to ", out_h5))
+write_h5_list(h5_list,
+              h5_file = out_h5,
+              overwrite = TRUE)
+h5closeAll()
+```
+
+[Return to Contents](#contents)
+
+<a id="qc_metrics"></a>
+
+## QC Tables and Plots
+
+Extract metadata for plotting
+```{r Assemble Metadata}
+stm("Generating tables and plots for report")
+meta <- h5_list_cell_metadata(h5_list)
+
+qc_list <- list(report_type = "add_tenx_rna_metadata",
+                report_datetime = as.character(start_time),
+                report_uuid = ids::uuid(use_time = TRUE),
+                package = "H5MANIPULATOR",
+                package_version = sessionInfo()$otherPkgs$H5MANIPULATOR$Version,
+                sample_id = in_sample)
+```
+
+[Return to Contents](#contents)
+
+<a id="sample_qc"></a>
+
+### Sample QC
+
+<a id="sample_metrics"></a>
+
+#### 10x Genomics Mapping Metrics
+```{r Sample Metrics}
+qc_sample_metrics <- data.frame(tenx_metric = names(sample_metrics),
+                              value = as.vector(unlist(sample_metrics)),
+                              stringsAsFactors = FALSE)
+
+qc_sample_metrics$value[qc_sample_metrics$tenx_metric == "number_of_reads"] <- as.numeric(qc_sample_metrics$value[qc_sample_metrics$tenx_metric == "number_of_reads"] / 1e6)
+qc_sample_metrics$tenx_metric[qc_sample_metrics$tenx_metric == "number_of_reads"] <- "millions_of_reads"
+
+qc_list$sample_metrics <- split(qc_sample_metrics$value, 1:nrow(qc_sample_metrics))
+names(qc_list$sample_metrics) <- qc_sample_metrics$tenx_metric
+
+qc_table(qc_sample_metrics)
+```
+
+[Return to Contents](#contents)
+
+<a id="rug_stats"></a>
+
+#### Sample Read/UMI/Gene Summary Stats
+```{r Read UMI Gene Stats}
+overview_stats <- data.frame(statistic = c("N Mapped Reads",
+                                           "N UMIs",
+                                           "N Mito. UMIs",
+                                           "N Genes",
+                                           "Reads per UMI",
+                                           "UMIs per Gene",
+                                           "Reads per Gene"),
+                             q_25 = c(quantile(meta$n_reads, 0.25),
+                                      quantile(meta$n_umis,  0.25),
+                                      quantile(meta$n_mito_umis, 0.25),
+                                      quantile(meta$n_genes, 0.25),
+                                      quantile(meta$n_reads/meta$n_umis, 0.25, na.rm = TRUE),
+                                      quantile(meta$n_umis/meta$n_genes, 0.25, na.rm = TRUE),
+                                      quantile(meta$n_reads/meta$n_genes, 0.25, na.rm = TRUE)),
+                             median = c(quantile(meta$n_reads, 0.5),
+                                        quantile(meta$n_umis,  0.50),
+                                        quantile(meta$n_mito_umis, 0.50),
+                                        quantile(meta$n_genes, 0.50),
+                                        quantile(meta$n_reads/meta$n_umis, 0.50, na.rm = TRUE),
+                                        quantile(meta$n_umis/meta$n_genes, 0.50, na.rm = TRUE),
+                                        quantile(meta$n_reads/meta$n_genes, 0.50, na.rm = TRUE)),
+                             q_75 = c(quantile(meta$n_reads, 0.75),
+                                      quantile(meta$n_umis,  0.75),
+                                      quantile(meta$n_mito_umis, 0.25),
+                                      quantile(meta$n_genes, 0.75),
+                                      quantile(meta$n_reads/meta$n_umis, 0.75, na.rm = TRUE),
+                                      quantile(meta$n_umis/meta$n_genes, 0.75, na.rm = TRUE),
+                                      quantile(meta$n_reads/meta$n_genes, 0.75, na.rm = TRUE)))
+
+overview_stats$q_25 <- round(overview_stats$q_25, 2)
+overview_stats$median <- round(overview_stats$median, 2)
+overview_stats$q_75 <- round(overview_stats$q_75, 2)
+
+qc_list$sample_count_stats <- lapply(1:nrow(overview_stats),
+                                      function(x) {
+                                        list(q_25 = overview_stats$q_25[x],
+                                             median = overview_stats$median[x],
+                                             q_75 = overview_stats$q_75[x])
+                                      })
+names(qc_list$sample_count_stats) <- tolower(gsub("[\\. ]+", "_", overview_stats$statistic))
+
+qc_table(overview_stats)
+```
+
+[Return to Contents](#contents)
+
+<a id="rug_hists"></a>
+
+### Well Read/UMI/Gene Histograms
+```{r QC histograms}
+reads_plot <- qc_hist_plot(meta,
+                           column = "n_reads",
+                           name_x = "N Reads per Cell",
+                           fill = "dodgerblue",
+                           target = 2e4) +
+  ggtitle("Alignment/Mapping Distributions")
+
+umis_plot <- qc_hist_plot(meta,
+                          column = "n_umis",
+                          name_x = "N UMIs per Cell",
+                          fill = "purple",
+                          target = 8e3)
+
+genes_plot <- qc_hist_plot(meta,
+                           column = "n_genes",
+                           name_x = "N Genes per Cell",
+                           fill = "orangered",
+                           target = 2e3)
+
+histogram_list <- list(reads_plot,
+                       umis_plot,
+                       genes_plot)
+
+suppressWarnings(
+  plot_grid(plotlist = histogram_list,
+            ncol = 1,
+            nrow = 3)
+)
+```
+
+[Return to Contents](#contents)
+
+<a id="rug_scatters"></a>
+
+#### UMIs vs Reads Scatter Plot
+```{r Read UMI Gene Scatter Plots}
+umi_reads_scatter <- qc_scatter_plot(meta,
+                                     column_x = "n_reads",
+                                     name_x = "N Reads per Cell",
+                                     column_y = "n_umis",
+                                     name_y = "N UMIs per Cell",
+                                     color = "darkblue") +
+  ggtitle("UMIs vs Reads")
+
+suppressWarnings(
+  umi_reads_scatter
+)
+```
+
+#### Genes vs UMIs Scatter Plot
+```{r}
+genes_umis_scatter <- qc_scatter_plot(meta,
+                                      column_x = "n_umis",
+                                      name_x = "N UMIs per Cell",
+                                      column_y = "n_genes",
+                                      name_y = "N Genes per Cell",
+                                      color = "red") +
+  ggtitle("Genes vs UMIs")
+
+suppressWarnings(
+  genes_umis_scatter
+)
+```
+
+#### Genes vs Reads Scatter Plot
+```{r}
+genes_reads_scatter <- qc_scatter_plot(meta,
+                                       column_x = "n_reads",
+                                       name_x = "N Reads per Cell",
+                                       column_y = "n_genes",
+                                       name_y = "N Genes per Cell",
+                                       color = "darkgreen") +
+  ggtitle("Genes vs Reads")
+
+suppressWarnings(
+  genes_reads_scatter
+)
+```
+
+[Return to Contents](#contents)
+
+<a id="json_out"></a>
+
+### Write QC JSON
+
+```{r Save QC JSON}
+stm(paste0("Writing JSON to ", out_json))
+
+#qc_list_json <- jsonlite::toJSON(qc_list,
+#                                 auto_unbox = TRUE,
+#                                 pretty = TRUE)
+
+#writeLines(qc_list_json,
+#           out_json)
+
+```
+
+[Return to Contents](#contents)
+
+<a id="session_info"></a>
+
+## Session Information
+
+```{r Session Info}
+sessionInfo()
+```
+
+Total time elapsed
+```{r Show Time}
+end_time <- Sys.time()
+diff_time <- end_time - start_time
+time_message <- paste0("Elapsed Time: ", 
+                       round(diff_time, 3),
+                       " ", units(diff_time))
+print(time_message)
+stm(time_message)
+stm("H5 metadata process complete.")
+```
+
+[Return to Contents]
